@@ -1,0 +1,28 @@
+{
+  "name": "perplexity-api-client",
+  "version": "1.0.0",
+  "description": "JavaScript client for Perplexity AI API with SSE support",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "server": "node server.js",
+    "query": "node perplexity.js",
+    "example": "node example.js"
+  },
+  "keywords": [
+    "perplexity",
+    "ai",
+    "sse",
+    "streaming",
+    "api-client"
+  ],
+  "author": "",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "express": "^5.2.1",
+    "puppeteer": "^22.15.0"
+  }
+}

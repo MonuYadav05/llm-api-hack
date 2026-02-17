@@ -1,20 +1,18 @@
 {
-  "name": "perplexity-api-client",
+  "name": "llm-api-hack",
   "version": "1.0.0",
-  "description": "JavaScript client for Perplexity AI API with SSE support",
+  "description": "Unified OpenAI-compatible API server for Perplexity AI and Google Gemini via browser automation",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "server": "node server.js",
-    "query": "node perplexity.js",
-    "example": "node example.js"
+    "query": "node perplexity.js"
   },
   "keywords": [
     "perplexity",
+    "gemini",
     "ai",
-    "sse",
-    "streaming",
-    "api-client"
+    "openai-compatible",
+    "api-server"
   ],
   "author": "",
   "license": "MIT",

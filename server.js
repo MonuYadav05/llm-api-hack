@@ -31,20 +31,20 @@ const crypto = require('crypto');
 // ─── Configuration ──────────────────────────────────────────────────────────
 
 const PORT = parseInt(process.env.PORT || '3000', 10);
-const MAX_TIMEOUT = 120000; // 2 minutes max per query
+const MAX_TIMEOUT = 300000; // 5 minutes max per query (2 min wait + 3 min extraction)
 const DEFAULT_MODEL = 'perplexity';
 
 const SUPPORTED_MODELS = {
     perplexity: { name: 'perplexity', owned_by: 'perplexity', url: 'https://www.perplexity.ai/' },
-    gemini:     { name: 'gemini',     owned_by: 'google',     url: 'https://gemini.google.com/app' },
+    gemini: { name: 'gemini', owned_by: 'google', url: 'https://gemini.google.com/app' },
 };
 
 // ─── Global State ───────────────────────────────────────────────────────────
 
 let browser = null;
 let browserReady = false;
-const requestQueue = [];
-let processing = false;
+let currentAbortController = null;
+let currentRequestId = null;
 
 // ─── Browser Management ────────────────────────────────────────────────────
 
@@ -205,7 +205,7 @@ async function perplexityExtract(page) {
     });
 }
 
-async function queryPerplexity(query, onChunk = null) {
+async function queryPerplexity(query, onChunk = null, abortSignal = null) {
     const { page, context } = await createPage();
     const requestId = crypto.randomUUID().slice(0, 8);
 
@@ -225,6 +225,10 @@ async function queryPerplexity(query, onChunk = null) {
         await new Promise(r => setTimeout(r, 5000));
 
         while (Date.now() - start < MAX_TIMEOUT) {
+            if (abortSignal?.aborted) {
+                console.log(`[perplexity:${requestId}] 🛑 Aborted by new request`);
+                throw new Error('Request aborted');
+            }
             const ext = await perplexityExtract(page);
             if (ext.answerText) {
                 if (onChunk && ext.answerText.length > lastChunkedLength) {
@@ -245,8 +249,17 @@ async function queryPerplexity(query, onChunk = null) {
         if (lastText) return { answer: lastText, sources: [] };
         throw new Error('Timeout: no answer from Perplexity');
     } finally {
-        await page.close().catch(() => {});
-        await context.close().catch(() => {});
+        await page.close().catch(() => { });
+        await context.close().catch(() => { });        // Close browser after every request
+        if (browser) {
+            try {
+                await browser.close();
+                browser = null;
+                browserReady = false;
+            } catch (e) {
+                console.error(`[perplexity:${requestId}] Browser close error:`, e.message);
+            }
+        }
     }
 }
 
@@ -329,35 +342,54 @@ async function geminiSubmit(page, query) {
 
 async function geminiExtract(page) {
     return page.evaluate(() => {
-        const responseSelectors = [
-            'message-content .markdown', 'model-response .markdown',
-            '.response-container .markdown', '.model-response-text',
-            '.response-content', '[class*="response"] .markdown',
-            '.markdown-main-panel', 'message-content', 'model-response',
-        ];
-
-        let answerText = '';
-        for (const sel of responseSelectors) {
-            const els = document.querySelectorAll(sel);
-            if (els.length > 0) {
-                const el = els[els.length - 1];
-                const clone = el.cloneNode(true);
-                clone.querySelectorAll('button, .actions, .feedback, [class*="action"], [class*="toolbar"], [class*="copy"]').forEach(c => c.remove());
-                const text = (clone.innerText || clone.textContent || '').trim();
-                if (text.length > answerText.length) answerText = text;
+        // Helper: check if an element IS or is inside a user-query element
+        function isUserQueryElement(el) {
+            if (!el) return false;
+            let current = el;
+            while (current) {
+                const tag = (current.tagName || '').toLowerCase();
+                if (tag === 'user-query') return true;
+                current = current.parentElement;
             }
+            return false;
         }
 
-        if (answerText.length < 30) {
-            const fallbackSels = ['[class*="markdown"]', '[class*="Markdown"]', '[class*="response"]', '[class*="Response"]', '[class*="answer"]', '.conversation-container'];
-            for (const sel of fallbackSels) {
+        let answerText = '';
+
+        // STRATEGY 1: Look ONLY in model-response elements (most reliable)
+        const modelResponses = document.querySelectorAll('model-response');
+        if (modelResponses.length > 0) {
+            const lastResponse = modelResponses[modelResponses.length - 1];
+            const clone = lastResponse.cloneNode(true);
+            clone.querySelectorAll('button, .actions, .feedback, [class*="action"], [class*="toolbar"], [class*="copy"]').forEach(c => c.remove());
+            answerText = (clone.innerText || clone.textContent || '').trim();
+        }
+
+        // STRATEGY 2: If no model-response or answer too short, try other selectors but SKIP user-query
+        if (answerText.length < 20) {
+            const responseSelectors = [
+                'model-response .markdown',
+                'message-content .markdown',
+                '.response-container .markdown',
+                '.model-response-text',
+                '[class*="response"] .markdown',
+                '.markdown-main-panel',
+            ];
+
+            for (const sel of responseSelectors) {
                 const els = document.querySelectorAll(sel);
-                for (const el of els) {
+                for (let i = els.length - 1; i >= 0; i--) {
+                    const el = els[i];
+                    if (isUserQueryElement(el)) continue;
                     const clone = el.cloneNode(true);
-                    clone.querySelectorAll('button, .actions').forEach(c => c.remove());
-                    const t = (clone.innerText || '').trim();
-                    if (t.length > answerText.length) answerText = t;
+                    clone.querySelectorAll('button, .actions, .feedback, [class*="action"], [class*="toolbar"], [class*="copy"]').forEach(c => c.remove());
+                    const text = (clone.innerText || clone.textContent || '').trim();
+                    if (text.length > answerText.length) {
+                        answerText = text;
+                        break;
+                    }
                 }
+                if (answerText.length > 20) break;
             }
         }
 
@@ -375,7 +407,7 @@ async function geminiExtract(page) {
     });
 }
 
-async function queryGemini(query, onChunk = null) {
+async function queryGemini(query, onChunk = null, abortSignal = null) {
     const { page, context } = await createPage();
     const requestId = crypto.randomUUID().slice(0, 8);
 
@@ -387,10 +419,10 @@ async function queryGemini(query, onChunk = null) {
         // Dismiss any initial dialogs
         await page.evaluate(() => {
             ['button[aria-label="Close"]', 'button[aria-label="Dismiss"]', 'button[aria-label="Got it"]',
-             '[class*="dismiss"]', '[class*="close-button"]'].forEach(sel => {
-                const btn = document.querySelector(sel);
-                if (btn) btn.click();
-            });
+                '[class*="dismiss"]', '[class*="close-button"]'].forEach(sel => {
+                    const btn = document.querySelector(sel);
+                    if (btn) btn.click();
+                });
         });
         await new Promise(r => setTimeout(r, 500));
 
@@ -401,12 +433,42 @@ async function queryGemini(query, onChunk = null) {
             throw new Error('Could not find input field on Gemini page');
         }
 
-        console.log(`[gemini:${requestId}] ⏳ Waiting for answer...`);
+        console.log(`[gemini:${requestId}] ⏳ Waiting for model-response element...`);
         const start = Date.now();
-        let lastText = '', stableCount = 0, lastChunkedLength = 0;
-        await new Promise(r => setTimeout(r, 5000));
 
-        while (Date.now() - start < MAX_TIMEOUT) {
+        // Wait for model-response element to appear (up to 2 minutes)
+        let responseAppeared = false;
+        for (let i = 0; i < 120; i++) {
+            if (abortSignal?.aborted) {
+                console.log(`[gemini:${requestId}] 🛑 Aborted by new request`);
+                throw new Error('Request aborted');
+            }
+            const hasResponse = await page.evaluate(() => {
+                const mr = document.querySelector('model-response');
+                return mr && (mr.innerText || '').trim().length > 5;
+            });
+            if (hasResponse) {
+                responseAppeared = true;
+                console.log(`[gemini:${requestId}] ✅ Response started after ${i + 1}s`);
+                break;
+            }
+            await new Promise(r => setTimeout(r, 1000));
+        }
+
+        if (!responseAppeared) {
+            console.log(`[gemini:${requestId}] ⚠️  No response after 2 minutes`);
+            throw new Error('No model-response element appeared after 2 minutes');
+        }
+
+        console.log(`[gemini:${requestId}] ⏳ Extracting full response...`);
+        let lastText = '', stableCount = 0, lastChunkedLength = 0;
+        const extractStart = Date.now();
+
+        while (Date.now() - extractStart < MAX_TIMEOUT - 120000) {
+            if (abortSignal?.aborted) {
+                console.log(`[gemini:${requestId}] 🛑 Aborted by new request`);
+                throw new Error('Request aborted');
+            }
             const ext = await geminiExtract(page);
             if (ext.answerText && ext.answerText.length > 10) {
                 if (onChunk && ext.answerText.length > lastChunkedLength) {
@@ -415,20 +477,48 @@ async function queryGemini(query, onChunk = null) {
                 }
                 if (ext.answerText === lastText) {
                     stableCount++;
-                    if ((!ext.isLoading && stableCount >= 3) || stableCount >= 10) {
-                        console.log(`[gemini:${requestId}] ✅ Done (${ext.answerText.length} chars)`);
+                    // Wait longer for stability: 5s if not loading, 15s max
+                    const requiredStable = !ext.isLoading ? 5 : 15;
+                    if (stableCount >= requiredStable) {
+                        console.log(`[gemini:${requestId}] ✅ Done (${ext.answerText.length} chars, stable for ${stableCount}s)`);
                         return { answer: ext.answerText, sources: [] };
                     }
-                } else { stableCount = 0; }
+                } else {
+                    stableCount = 0;
+                }
                 lastText = ext.answerText;
             }
             await new Promise(r => setTimeout(r, 1000));
         }
-        if (lastText) return { answer: lastText, sources: [] };
+        if (lastText) {
+            console.log(`[gemini:${requestId}] ⏰ Timeout, returning partial (${lastText.length} chars)`);
+            return { answer: lastText, sources: [] };
+        }
         throw new Error('Timeout: no answer from Gemini');
+    } catch (err) {
+        console.error(`[gemini:${requestId}] ❌ Error:`, err.message);
+        throw err;
     } finally {
-        await page.close().catch(() => {});
-        await context.close().catch(() => {});
+        try {
+            await page.close();
+        } catch (e) {
+            console.error(`[gemini:${requestId}] Page close error:`, e.message);
+        }
+        try {
+            await context.close();
+        } catch (e) {
+            console.error(`[gemini:${requestId}] Context close error:`, e.message);
+        }
+        // Close browser after every request
+        if (browser) {
+            try {
+                await browser.close();
+                browser = null;
+                browserReady = false;
+            } catch (e) {
+                console.error(`[gemini:${requestId}] Browser close error:`, e.message);
+            }
+        }
     }
 }
 
@@ -439,29 +529,27 @@ async function queryGemini(query, onChunk = null) {
 function getQueryFn(modelName) {
     const model = (modelName || DEFAULT_MODEL).toLowerCase().trim();
     if (model.includes('perplexity') || model === 'pplx') return queryPerplexity;
-    if (model.includes('gemini'))                          return queryGemini;
+    if (model.includes('gemini')) return queryGemini;
     return null;
 }
 
-// ─── Request Queue ──────────────────────────────────────────────────────────
+// ─── Request Handler (Latest Only) ─────────────────────────────────────────
 
-function enqueue(task) {
-    return new Promise((resolve, reject) => {
-        requestQueue.push({ task, resolve, reject });
-        processQueue();
-    });
-}
-
-async function processQueue() {
-    if (processing || requestQueue.length === 0) return;
-    processing = true;
-    const { task, resolve, reject } = requestQueue.shift();
-    try { resolve(await task()); }
-    catch (err) { reject(err); }
-    finally {
-        processing = false;
-        if (requestQueue.length > 0) processQueue();
+function executeLatestOnly(task) {
+    // Abort any currently running request
+    if (currentAbortController && currentRequestId) {
+        console.log(`🛑 Aborting previous request [${currentRequestId}]`);
+        currentAbortController.abort();
     }
+
+    // Create new abort controller for this request
+    const abortController = new AbortController();
+    const requestId = crypto.randomUUID().slice(0, 8);
+    currentAbortController = abortController;
+    currentRequestId = requestId;
+
+    // Execute the task with abort signal
+    return task(abortController.signal);
 }
 
 // ─── OpenAI Format Helpers ──────────────────────────────────────────────────
@@ -507,8 +595,7 @@ app.get('/health', (req, res) => {
         status: 'ok',
         browser: browserReady ? 'running' : 'stopped',
         models: Object.keys(SUPPORTED_MODELS),
-        queueLength: requestQueue.length,
-        processing
+        currentRequest: currentRequestId || null
     });
 });
 
@@ -546,21 +633,22 @@ app.post('/v1/chat/completions', async (req, res) => {
         });
     }
 
-    const query = messages.map(m => {
-        if (m.role === 'system') return `[System: ${m.content}]`;
+    const systemMessages = messages.filter(m => m.role === 'system').map(m => m.content).join('\n');
+    const nonSystemMessages = messages.filter(m => m.role !== 'system').map(m => {
         if (m.role === 'user') return m.content;
         if (m.role === 'assistant') return `[Previous answer: ${m.content}]`;
         return m.content;
     }).join('\n\n');
+
+    const query = systemMessages
+        ? `${systemMessages}\n\n${nonSystemMessages}`
+        : nonSystemMessages;
 
     if (!query.trim()) {
         return res.status(400).json({
             error: { message: 'No content found in messages', type: 'invalid_request_error', param: 'messages', code: 'empty_content' }
         });
     }
-
-    const queuePos = requestQueue.length;
-    if (queuePos > 0) console.log(`📋 Request queued (position ${queuePos})`);
 
     // ── Streaming ──
     if (stream) {
@@ -577,11 +665,11 @@ app.post('/v1/chat/completions', async (req, res) => {
         res.write(`data: ${JSON.stringify(roleChunk)}\n\n`);
 
         try {
-            await enqueue(() => queryFn(query, (chunk) => {
+            await executeLatestOnly((abortSignal) => queryFn(query, (chunk) => {
                 if (!res.writableEnded) {
                     res.write(`data: ${JSON.stringify(buildStreamChunk(chunk, requestModel))}\n\n`);
                 }
-            }));
+            }, abortSignal));
             if (!res.writableEnded) {
                 res.write(`data: ${JSON.stringify(buildStreamChunk('', requestModel, 'stop'))}\n\n`);
                 res.write('data: [DONE]\n\n');
@@ -600,7 +688,7 @@ app.post('/v1/chat/completions', async (req, res) => {
 
     // ── Non-Streaming ──
     try {
-        const result = await enqueue(() => queryFn(query));
+        const result = await executeLatestOnly((abortSignal) => queryFn(query, null, abortSignal));
         res.json(buildCompletionResponse(result.answer, requestModel, result.sources || []));
     } catch (err) {
         console.error('❌ Error:', err.message);
@@ -643,12 +731,12 @@ async function start() {
 
 process.on('SIGINT', async () => {
     console.log('\n🛑 Shutting down...');
-    if (browser) await browser.close().catch(() => {});
+    if (browser) await browser.close().catch(() => { });
     process.exit(0);
 });
 
 process.on('SIGTERM', async () => {
-    if (browser) await browser.close().catch(() => {});
+    if (browser) await browser.close().catch(() => { });
     process.exit(0);
 });
 

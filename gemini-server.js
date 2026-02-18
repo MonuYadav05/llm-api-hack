@@ -29,15 +29,15 @@ const crypto = require('crypto');
 
 const PORT = parseInt(process.env.GEMINI_PORT || process.env.PORT || '3001', 10);
 const MODEL_NAME = 'gemini';
-const MAX_TIMEOUT = 120000; // 2 minutes max per query
+const MAX_TIMEOUT = 300000; // 5 minutes max per query (2 min wait + 3 min extraction)
 const GEMINI_URL = 'https://gemini.google.com/app';
 
 // ─── Global State ───────────────────────────────────────────────────────────
 
 let browser = null;
 let browserReady = false;
-const requestQueue = [];
-let processing = false;
+let currentAbortController = null;
+let currentRequestId = null;
 
 // ─── Browser Management ────────────────────────────────────────────────────
 
@@ -200,59 +200,58 @@ async function submitQuery(page, query) {
 
 async function extractAnswer(page) {
     return page.evaluate(() => {
-        // Gemini renders responses in various container elements.
-        // We look for the LAST response block (the newest answer).
-        const responseSelectors = [
-            'message-content .markdown',           // Main markdown response
-            'model-response .markdown',             // Model response container
-            '.response-container .markdown',
-            '.model-response-text',
-            '.response-content',
-            '[class*="response"] .markdown',
-            '.markdown-main-panel',
-            'message-content',                      // Fallback without .markdown
-            'model-response',
-        ];
+        // Helper: check if an element IS or is inside a user-query element
+        function isUserQueryElement(el) {
+            if (!el) return false;
+            let current = el;
+            while (current) {
+                const tag = (current.tagName || '').toLowerCase();
+                if (tag === 'user-query') return true;
+                current = current.parentElement;
+            }
+            return false;
+        }
 
         let answerText = '';
 
-        for (const sel of responseSelectors) {
-            const els = document.querySelectorAll(sel);
-            if (els.length > 0) {
-                // Get the LAST response element (newest answer)
-                const el = els[els.length - 1];
-                const clone = el.cloneNode(true);
-
-                // Remove any action buttons, feedback icons, copy buttons etc.
-                clone.querySelectorAll(
-                    'button, .actions, .feedback, [class*="action"], [class*="toolbar"], [class*="copy"]'
-                ).forEach(c => c.remove());
-
-                const text = (clone.innerText || clone.textContent || '').trim();
-                if (text.length > answerText.length) {
-                    answerText = text;
-                }
-            }
+        // STRATEGY 1: Look ONLY in model-response elements (most reliable)
+        const modelResponses = document.querySelectorAll('model-response');
+        if (modelResponses.length > 0) {
+            const lastResponse = modelResponses[modelResponses.length - 1];
+            const clone = lastResponse.cloneNode(true);
+            clone.querySelectorAll(
+                'button, .actions, .feedback, [class*="action"], [class*="toolbar"], [class*="copy"]'
+            ).forEach(c => c.remove());
+            answerText = (clone.innerText || clone.textContent || '').trim();
         }
 
-        // Broader fallback: look for any large text block that appeared
-        if (answerText.length < 30) {
-            const fallbackSels = [
-                '[class*="markdown"]',
-                '[class*="Markdown"]',
-                '[class*="response"]',
-                '[class*="Response"]',
-                '[class*="answer"]',
-                '.conversation-container',
+        // STRATEGY 2: If no model-response or answer too short, try other selectors but SKIP user-query
+        if (answerText.length < 20) {
+            const responseSelectors = [
+                'model-response .markdown',
+                'message-content .markdown',
+                '.response-container .markdown',
+                '.model-response-text',
+                '[class*="response"] .markdown',
+                '.markdown-main-panel',
             ];
-            for (const sel of fallbackSels) {
+
+            for (const sel of responseSelectors) {
                 const els = document.querySelectorAll(sel);
-                for (const el of els) {
+                for (let i = els.length - 1; i >= 0; i--) {
+                    const el = els[i];
+                    if (isUserQueryElement(el)) continue;
                     const clone = el.cloneNode(true);
-                    clone.querySelectorAll('button, .actions').forEach(c => c.remove());
-                    const t = (clone.innerText || '').trim();
-                    if (t.length > answerText.length) answerText = t;
+                    clone.querySelectorAll(
+                        'button, .actions, .feedback, [class*="action"], [class*="toolbar"], [class*="copy"]'
+                    ).forEach(c => c.remove());
+                    const text = (clone.innerText || clone.textContent || '').trim();
+                    if (text.length > answerText.length) {
+                        answerText = text;
+                        break;
+                    }
                 }
+                if (answerText.length > 20) break;
             }
         }
 
@@ -265,7 +264,6 @@ async function extractAnswer(page) {
             document.querySelector('[class*="progress"]') ||
             document.querySelector('mat-progress-bar') ||
             document.querySelector('.loading-indicator') ||
-            // Gemini specific: the "thinking" animation
             document.querySelector('[class*="thinking"]') ||
             document.querySelector('[class*="generating"]')
         );
@@ -280,7 +278,7 @@ async function extractAnswer(page) {
 
 // ─── Query Gemini ───────────────────────────────────────────────────────────
 
-async function queryGemini(query, onChunk = null) {
+async function queryGemini(query, onChunk = null, abortSignal = null) {
     const { page, context } = await createPage();
     const requestId = crypto.randomUUID();
 
@@ -319,17 +317,44 @@ async function queryGemini(query, onChunk = null) {
             throw new Error('Could not find input field on Gemini page');
         }
 
-        console.log(`[${requestId}] ⏳ Waiting for answer...`);
-
+        console.log(`[${requestId}] ⏳ Waiting for model-response element...`);
         const start = Date.now();
+
+        // Wait for model-response element to appear (up to 2 minutes)
+        let responseAppeared = false;
+        for (let i = 0; i < 120; i++) {
+            if (abortSignal?.aborted) {
+                console.log(`[${requestId}] 🛑 Aborted by new request`);
+                throw new Error('Request aborted');
+            }
+            const hasResponse = await page.evaluate(() => {
+                const mr = document.querySelector('model-response');
+                return mr && (mr.innerText || '').trim().length > 5;
+            });
+            if (hasResponse) {
+                responseAppeared = true;
+                console.log(`[${requestId}] ✅ Response started after ${i + 1}s`);
+                break;
+            }
+            await new Promise(r => setTimeout(r, 1000));
+        }
+
+        if (!responseAppeared) {
+            console.log(`[${requestId}] ⚠️  No response after 2 minutes`);
+            throw new Error('No model-response element appeared after 2 minutes');
+        }
+
+        console.log(`[${requestId}] ⏳ Extracting full response...`);
         let lastText = '';
         let stableCount = 0;
         let lastChunkedLength = 0;
+        const extractStart = Date.now();
 
-        // Wait for Gemini to start generating
-        await new Promise(r => setTimeout(r, 5000));
-
-        while (Date.now() - start < MAX_TIMEOUT) {
+        while (Date.now() - extractStart < MAX_TIMEOUT - 120000) {
+            if (abortSignal?.aborted) {
+                console.log(`[${requestId}] 🛑 Aborted by new request`);
+                throw new Error('Request aborted');
+            }
             const extraction = await extractAnswer(page);
 
             if (extraction.answerText && extraction.answerText.length > 10) {
@@ -342,9 +367,10 @@ async function queryGemini(query, onChunk = null) {
 
                 if (extraction.answerText === lastText) {
                     stableCount++;
-                    // Stable for 3s and not loading, or 10s regardless
-                    if ((!extraction.isLoading && stableCount >= 3) || stableCount >= 10) {
-                        console.log(`[${requestId}] ✅ Answer complete (${extraction.answerText.length} chars)`);
+                    // Wait longer for stability: 5s if not loading, 15s max
+                    const requiredStable = !extraction.isLoading ? 5 : 15;
+                    if (stableCount >= requiredStable) {
+                        console.log(`[${requestId}] ✅ Answer complete (${extraction.answerText.length} chars, stable for ${stableCount}s)`);
                         return { answer: extraction.answerText };
                     }
                 } else {
@@ -357,42 +383,56 @@ async function queryGemini(query, onChunk = null) {
         }
 
         if (lastText) {
-            console.log(`[${requestId}] ⏰ Timeout, returning partial answer`);
+            console.log(`[${requestId}] ⏰ Timeout, returning partial answer (${lastText.length} chars)`);
             return { answer: lastText };
         }
 
         throw new Error('Timeout: no answer received from Gemini');
 
-    } finally {
-        await page.close().catch(() => { }); await context.close().catch(() => { });
-    }
-}
-
-// ─── Request Queue ──────────────────────────────────────────────────────────
-
-function enqueue(task) {
-    return new Promise((resolve, reject) => {
-        requestQueue.push({ task, resolve, reject });
-        processQueue();
-    });
-}
-
-async function processQueue() {
-    if (processing || requestQueue.length === 0) return;
-    processing = true;
-
-    const { task, resolve, reject } = requestQueue.shift();
-    try {
-        const result = await task();
-        resolve(result);
     } catch (err) {
-        reject(err);
+        console.error(`[${requestId}] ❌ Error:`, err.message);
+        throw err;
     } finally {
-        processing = false;
-        if (requestQueue.length > 0) {
-            processQueue();
+        try {
+            await page.close();
+        } catch (e) {
+            console.error(`[${requestId}] Page close error:`, e.message);
+        }
+        try {
+            await context.close();
+        } catch (e) {
+            console.error(`[${requestId}] Context close error:`, e.message);
+        }
+        // Close browser after every request
+        if (browser) {
+            try {
+                await browser.close();
+                browser = null;
+                browserReady = false;
+            } catch (e) {
+                console.error(`[${requestId}] Browser close error:`, e.message);
+            }
         }
     }
+}
+
+// ─── Request Handler (Latest Only) ─────────────────────────────────────────
+
+function executeLatestOnly(task) {
+    // Abort any currently running request
+    if (currentAbortController && currentRequestId) {
+        console.log(`🛑 Aborting previous request [${currentRequestId}]`);
+        currentAbortController.abort();
+    }
+
+    // Create new abort controller for this request
+    const abortController = new AbortController();
+    const requestId = crypto.randomUUID().slice(0, 8);
+    currentAbortController = abortController;
+    currentRequestId = requestId;
+
+    // Execute the task with abort signal
+    return task(abortController.signal);
 }
 
 // ─── OpenAI Format Helpers ──────────────────────────────────────────────────
@@ -454,8 +494,7 @@ app.get('/health', (req, res) => {
     res.json({
         status: 'ok',
         browser: browserReady ? 'running' : 'stopped',
-        queueLength: requestQueue.length,
-        processing
+        currentRequest: currentRequestId || null
     });
 });
 
@@ -491,14 +530,16 @@ app.post('/v1/chat/completions', async (req, res) => {
     }
 
     // Build query from messages
-    const query = messages
-        .map(m => {
-            if (m.role === 'system') return `[System instruction: ${m.content}]`;
-            if (m.role === 'user') return m.content;
-            if (m.role === 'assistant') return `[Previous answer: ${m.content}]`;
-            return m.content;
-        })
-        .join('\n\n');
+    const systemMessages = messages.filter(m => m.role === 'system').map(m => m.content).join('\n');
+    const nonSystemMessages = messages.filter(m => m.role !== 'system').map(m => {
+        if (m.role === 'user') return m.content;
+        if (m.role === 'assistant') return `[Previous answer: ${m.content}]`;
+        return m.content;
+    }).join('\n\n');
+
+    const query = systemMessages
+        ? `${systemMessages}\n\n${nonSystemMessages}`
+        : nonSystemMessages;
 
     if (!query.trim()) {
         return res.status(400).json({
@@ -512,10 +553,6 @@ app.post('/v1/chat/completions', async (req, res) => {
     }
 
     const requestModel = model || MODEL_NAME;
-    const queuePosition = requestQueue.length;
-    if (queuePosition > 0) {
-        console.log(`📋 Request queued (position ${queuePosition})`);
-    }
 
     // ── Streaming ──
     if (stream) {
@@ -538,12 +575,12 @@ app.post('/v1/chat/completions', async (req, res) => {
         res.write(`data: ${JSON.stringify(roleChunk)}\n\n`);
 
         try {
-            await enqueue(() => queryGemini(query, (chunk) => {
+            await executeLatestOnly((abortSignal) => queryGemini(query, (chunk) => {
                 if (!res.writableEnded) {
                     const sseChunk = buildStreamChunk(chunk, requestModel);
                     res.write(`data: ${JSON.stringify(sseChunk)}\n\n`);
                 }
-            }));
+            }, abortSignal));
 
             if (!res.writableEnded) {
                 const finishChunk = buildStreamChunk('', requestModel, 'stop');
@@ -565,7 +602,7 @@ app.post('/v1/chat/completions', async (req, res) => {
 
     // ── Non-Streaming ──
     try {
-        const result = await enqueue(() => queryGemini(query));
+        const result = await executeLatestOnly((abortSignal) => queryGemini(query, null, abortSignal));
         const response = buildCompletionResponse(result.answer, requestModel);
         res.json(response);
     } catch (err) {

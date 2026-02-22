@@ -29,7 +29,7 @@ const crypto = require('crypto');
 
 const PORT = parseInt(process.env.GEMINI_PORT || process.env.PORT || '3001', 10);
 const MODEL_NAME = 'gemini';
-const MAX_TIMEOUT = 120000; // 2 minutes max per query
+const MAX_TIMEOUT = 300000; // 5 minutes max per query (pro model needs time to think)
 const GEMINI_URL = 'https://gemini.google.com/app';
 
 // ─── Global State ───────────────────────────────────────────────────────────
@@ -43,14 +43,20 @@ let processing = false;
 
 async function initBrowser() {
     console.log('🚀 Launching headless browser...');
+    // userDataDir persists cookies/login between restarts.
+    // On first run: log in to Google manually in the opened window, then all
+    // future runs will reuse that session automatically.
+    const userDataDir = path.join(__dirname, 'chrome-profile');
     browser = await puppeteer.launch({
-        headless: 'new',
-        defaultViewport: { width: 1920, height: 1080 },
+        headless: false,
+        defaultViewport: null,          // use real window size
+        userDataDir,
         args: [
             '--no-sandbox',
             '--disable-setuid-sandbox',
             '--disable-blink-features=AutomationControlled',
-            '--disable-gpu'
+            '--disable-gpu',
+            '--start-maximized'
         ]
     });
 
@@ -74,10 +80,8 @@ async function ensureBrowser() {
 async function createPage() {
     const b = await ensureBrowser();
 
-    // Use an incognito browser context for each request
-    // so we always get a fresh Gemini homepage
-    const context = await b.createBrowserContext();
-    const page = await context.newPage();
+    // Open a regular page in the default context so it's visible in the browser window
+    const page = await b.newPage();
 
     // Hide automation signals
     await page.evaluateOnNewDocument(() => {
@@ -89,7 +93,10 @@ async function createPage() {
         'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36'
     );
 
-    return { page, context };
+    // Bring this tab to the front so it's visible
+    await page.bringToFront();
+
+    return { page, context: null };
 }
 
 // ─── Submit Query ───────────────────────────────────────────────────────────
@@ -198,84 +205,139 @@ async function submitQuery(page, query) {
 
 // ─── Extract Answer from Gemini DOM ─────────────────────────────────────────
 
-async function extractAnswer(page) {
-    return page.evaluate(() => {
-        // Gemini renders responses in various container elements.
-        // We look for the LAST response block (the newest answer).
-        const responseSelectors = [
-            'message-content .markdown',           // Main markdown response
-            'model-response .markdown',             // Model response container
-            '.response-container .markdown',
-            '.model-response-text',
-            '.response-content',
-            '[class*="response"] .markdown',
-            '.markdown-main-panel',
-            'message-content',                      // Fallback without .markdown
-            'model-response',
-        ];
-
-        let answerText = '';
-
-        for (const sel of responseSelectors) {
-            const els = document.querySelectorAll(sel);
-            if (els.length > 0) {
-                // Get the LAST response element (newest answer)
-                const el = els[els.length - 1];
-                const clone = el.cloneNode(true);
-
-                // Remove any action buttons, feedback icons, copy buttons etc.
-                clone.querySelectorAll(
-                    'button, .actions, .feedback, [class*="action"], [class*="toolbar"], [class*="copy"]'
-                ).forEach(c => c.remove());
-
-                const text = (clone.innerText || clone.textContent || '').trim();
-                if (text.length > answerText.length) {
-                    answerText = text;
-                }
-            }
+async function extractAnswer(page, query = '') {
+    return page.evaluate((inputQuery) => {
+        // ── Helper: get cleaned text from an element, stripping UI chrome ──
+        function cleanText(el) {
+            const clone = el.cloneNode(true);
+            // Remove screen-reader-only / visually-hidden nodes (e.g. "You said" spans)
+            // NOTE: do NOT strip [aria-hidden="true"] broadly — it also covers real content nodes
+            clone.querySelectorAll(
+                '.cdk-visually-hidden, ' +
+                'button, .actions, .feedback, [class*="action"], [class*="toolbar"], ' +
+                '[class*="copy"], [class*="vote"], [class*="rating"], [aria-label*="Copy"]'
+            ).forEach(c => c.remove());
+            return (clone.innerText || clone.textContent || '').trim();
         }
 
-        // Broader fallback: look for any large text block that appeared
-        if (answerText.length < 30) {
-            const fallbackSels = [
-                '[class*="markdown"]',
-                '[class*="Markdown"]',
-                '[class*="response"]',
-                '[class*="Response"]',
-                '[class*="answer"]',
-                '.conversation-container',
-            ];
-            for (const sel of fallbackSels) {
-                const els = document.querySelectorAll(sel);
-                for (const el of els) {
-                    const clone = el.cloneNode(true);
-                    clone.querySelectorAll('button, .actions').forEach(c => c.remove());
-                    const t = (clone.innerText || '').trim();
+        // ── Detect if model-response element exists (generation complete signal) ──
+        const modelResponseExists = !!document.querySelector('model-response');
+
+        // ── Strategy 1: model-response (appears when Gemini finishes generating) ──
+        // This is the most reliable selector for the final answer.
+        let answerText = '';
+
+        if (modelResponseExists) {
+            const modelEls = Array.from(document.querySelectorAll('model-response .markdown'));
+            if (modelEls.length > 0) {
+                const t = cleanText(modelEls[modelEls.length - 1]);
+                if (t.length > answerText.length) answerText = t;
+            }
+            if (answerText.length < 30) {
+                const modelEls2 = Array.from(document.querySelectorAll('model-response'));
+                if (modelEls2.length > 0) {
+                    const t = cleanText(modelEls2[modelEls2.length - 1]);
                     if (t.length > answerText.length) answerText = t;
                 }
             }
         }
 
-        // Detect loading state
-        const isLoading = !!(
-            document.querySelector('[class*="loading"]') ||
-            document.querySelector('[class*="typing"]') ||
-            document.querySelector('[class*="spinner"]') ||
-            document.querySelector('[class*="Spinner"]') ||
-            document.querySelector('[class*="progress"]') ||
-            document.querySelector('mat-progress-bar') ||
-            document.querySelector('.loading-indicator') ||
-            // Gemini specific: the "thinking" animation
-            document.querySelector('[class*="thinking"]') ||
-            document.querySelector('[class*="generating"]')
-        );
+        // ── Strategy 2: response-container-content (live content area during streaming) ──
+        // The actual div where Gemini streams response text before model-response appears.
+        if (answerText.length < 30) {
+            const contentEls = Array.from(document.querySelectorAll(
+                '.response-container-content .markdown, ' +
+                '.response-container-content message-content .markdown, ' +
+                '.response-container-content'
+            ));
+            for (const el of contentEls) {
+                // Only pick elements that are inside pending-response (not user-query)
+                if (el.closest('user-query') || el.closest('[class*="user-query"]')) continue;
+                const t = cleanText(el);
+                if (t.length > answerText.length) answerText = t;
+            }
+        }
+
+        // ── Strategy 3: message-content / markdown-main-panel ──
+        if (answerText.length < 30) {
+            const selectors = [
+                'message-content .markdown',
+                '.markdown-main-panel',
+                'response-container .markdown',
+                '[data-speaker="model"] .markdown',
+                '[data-role="assistant"] .markdown',
+                '[data-speaker="model"]',
+                '[data-role="assistant"]',
+            ];
+            for (const sel of selectors) {
+                const els = Array.from(document.querySelectorAll(sel))
+                    .filter(el => !el.closest('user-query') && !el.closest('[class*="user-query"]'));
+                if (els.length > 0) {
+                    const t = cleanText(els[els.length - 1]);
+                    if (t.length > answerText.length) answerText = t;
+                }
+            }
+        }
+
+        // ── Strategy 4: broad markdown fallback, strictly skipping user containers ──
+        if (answerText.length < 30) {
+            const els = Array.from(document.querySelectorAll('[class*="markdown"], [class*="Markdown"]'))
+                .filter(el =>
+                    !el.closest('user-query') &&
+                    !el.closest('[class*="user-query"]') &&
+                    !el.closest('.ql-editor') &&
+                    !el.closest('rich-textarea') &&
+                    !el.closest('[role="textbox"]')
+                );
+            for (const el of els) {
+                const t = cleanText(el);
+                if (t.length > answerText.length) answerText = t;
+            }
+        }
+
+        // ── Strategy 5: last-resort — grab model-response raw innerText ──
+        // For fast responses where DOM structure differs from the expected layout
+        if (answerText.length < 30) {
+            const el = document.querySelector('model-response');
+            if (el) {
+                // Clone and only strip the "You said" visually-hidden span
+                const clone = el.cloneNode(true);
+                clone.querySelectorAll('.cdk-visually-hidden, button').forEach(c => c.remove());
+                const t = (clone.innerText || clone.textContent || '').trim();
+                if (t.length > answerText.length) answerText = t;
+            }
+        }
+
+        // ── Echo guard: discard text that is the user's query echoed back ──
+        if (inputQuery && answerText) {
+            const norm = s => s.replace(/\s+/g, ' ').trim().toLowerCase();
+            const normAnswer = norm(answerText);
+            const normQuery = norm(inputQuery);
+            if (
+                normAnswer === normQuery ||
+                normAnswer.startsWith(normQuery.slice(0, 120)) ||
+                normAnswer.startsWith('you said ' + normQuery.slice(0, 100)) ||
+                normAnswer.replace(/^you said\s*/i, '').startsWith(normQuery.slice(0, 120))
+            ) {
+                answerText = '';
+            }
+        }
+
+        // ── Detect if still generating ──
+        // pending-response exists = Gemini still generating
+        // model-response exists  = Gemini done generating
+        const stillGenerating = !!document.querySelector('pending-response');
 
         const prevLen = parseInt(document.body.getAttribute('data-prev-len') || '0');
         document.body.setAttribute('data-prev-len', String(answerText.length));
         const isGrowing = answerText.length > prevLen && prevLen > 0;
 
-        return { answerText, isLoading: isLoading || isGrowing };
-    });
+        return {
+            answerText,
+            isLoading: stillGenerating || isGrowing,
+            modelResponseExists
+        };
+    }, query);
 }
 
 // ─── Query Gemini ───────────────────────────────────────────────────────────
@@ -319,21 +381,72 @@ async function queryGemini(query, onChunk = null) {
             throw new Error('Could not find input field on Gemini page');
         }
 
-        console.log(`[${requestId}] ⏳ Waiting for answer...`);
+        console.log(`[${requestId}] ⏳ Waiting for Gemini to start generating...`);
+
+        // Wait for pending-response to appear — confirms query was received and generation started
+        try {
+            await page.waitForSelector('pending-response', { timeout: 60000 });
+            console.log(`[${requestId}] 🟢 Generation started (pending-response detected)`);
+        } catch {
+            console.log(`[${requestId}] ⚠️  pending-response not seen within 30s, continuing anyway`);
+        }
+
+        // Save debug snapshot of DOM during early generation for diagnostics
+        try {
+            const debugHtml = await page.content();
+            fs.writeFileSync(path.join(__dirname, 'debug-gemini-response.html'), debugHtml);
+            console.log(`[${requestId}] 🔍 Debug snapshot saved`);
+
+            const domAnalysis = await page.evaluate(() => {
+                const tags = [
+                    'model-response', 'pending-response', 'user-query',
+                    'message-content', 'response-container'
+                ];
+                const results = [];
+                for (const tag of tags) {
+                    const els = document.querySelectorAll(tag);
+                    if (els.length > 0) {
+                        els.forEach((el, i) => {
+                            const preview = (el.innerText || el.textContent || '').trim().slice(0, 80).replace(/\n/g, ' ');
+                            results.push(`  ${tag}[${i}] → "${preview}"`);
+                        });
+                    }
+                }
+                return results.length ? results.join('\n') : '  (no expected elements found)';
+            });
+            console.log(`[${requestId}] 🗂️  DOM analysis:\n${domAnalysis}`);
+        } catch { /* non-fatal */ }
+
+        // Wait for model-response to appear OR pending-response to disappear
+        // — either event signals that Gemini has finished generating
+        console.log(`[${requestId}] ⏳ Waiting for generation to complete (model-response)...`);
+        try {
+            await page.waitForFunction(
+                () => !!document.querySelector('model-response') || !document.querySelector('pending-response'),
+                { timeout: MAX_TIMEOUT - 65000, polling: 500 }
+            );
+            console.log(`[${requestId}] 🏁 Generation complete signal received`);
+        } catch {
+            console.log(`[${requestId}] ⚠️  Generation complete signal timed out, extracting whatever is available`);
+        }
+
+        // Give the DOM a moment to settle after generation completes
+        // (especially important for fast/short responses where model-response
+        //  appears almost immediately after pending-response disappears)
+        await new Promise(r => setTimeout(r, 800));
 
         const start = Date.now();
         let lastText = '';
         let stableCount = 0;
         let lastChunkedLength = 0;
 
-        // Wait for Gemini to start generating
-        await new Promise(r => setTimeout(r, 5000));
-
-        while (Date.now() - start < MAX_TIMEOUT) {
-            const extraction = await extractAnswer(page);
+        // Poll for stable answer text (handles both streaming and final state)
+        while (Date.now() - start < 120000) {
+            const extraction = await extractAnswer(page, query);
 
             if (extraction.answerText && extraction.answerText.length > 10) {
-                // Send incremental chunks for streaming
+                console.log(`[${requestId}] 📝 Extracted ${extraction.answerText.length} chars, loading=${extraction.isLoading}, modelDone=${extraction.modelResponseExists}, preview="${extraction.answerText.slice(0, 80).replace(/\n/g, ' ')}"`);
+
                 if (onChunk && extraction.answerText.length > lastChunkedLength) {
                     const newContent = extraction.answerText.slice(lastChunkedLength);
                     onChunk(newContent);
@@ -342,8 +455,9 @@ async function queryGemini(query, onChunk = null) {
 
                 if (extraction.answerText === lastText) {
                     stableCount++;
-                    // Stable for 3s and not loading, or 10s regardless
-                    if ((!extraction.isLoading && stableCount >= 3) || stableCount >= 10) {
+                    // Stable for 2s when model-response exists, or 5s otherwise, or 10s regardless
+                    const doneThreshold = extraction.modelResponseExists ? 2 : 5;
+                    if ((!extraction.isLoading && stableCount >= doneThreshold) || stableCount >= 10) {
                         console.log(`[${requestId}] ✅ Answer complete (${extraction.answerText.length} chars)`);
                         return { answer: extraction.answerText };
                     }
@@ -351,6 +465,10 @@ async function queryGemini(query, onChunk = null) {
                     stableCount = 0;
                 }
                 lastText = extraction.answerText;
+            } else if (extraction.modelResponseExists && lastText) {
+                // model-response exists but extraction found nothing — fall back to lastText
+                console.log(`[${requestId}] ✅ model-response present, using last extracted text`);
+                return { answer: lastText };
             }
 
             await new Promise(r => setTimeout(r, 1000));
@@ -364,7 +482,7 @@ async function queryGemini(query, onChunk = null) {
         throw new Error('Timeout: no answer received from Gemini');
 
     } finally {
-        await page.close().catch(() => { }); await context.close().catch(() => { });
+        await page.close().catch(() => { });
     }
 }
 

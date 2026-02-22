@@ -3,6 +3,8 @@
 
 # Node modules
 node_modules/
+chrome-extension/node_modules/
+chrome-profile
 
 # Logs
 *.log
